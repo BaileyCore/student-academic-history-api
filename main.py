@@ -157,3 +157,106 @@ def get_profile(student_id: str):
     with app.state.lock:
         student = require_student(student_id)
         return {"student_id": student_id, "history": [dict(c) for c in student["history"]], "plan": [dict(c) for c in student["plan"]]}
+
+# Phase 3: catalog import and academic audit integration.
+app.state.catalog = {}
+
+
+def normalize_code(value: str) -> str:
+    return re.sub(r'[\s-]', '', value).upper()
+
+
+def course_codes(value: str) -> list[str]:
+    return list(dict.fromkeys(normalize_code(c) for c in
+        re.findall(r'\b[A-Za-z]{3,5}[ -]?\d{4}[A-Za-z]?\b', value)))
+
+
+def term_order(term: str) -> tuple[int, int]:
+    match = re.fullmatch(r'(\d{2}|\d{4})([WSF])', term.upper().strip())
+    if not match:
+        raise HTTPException(422, detail=f'Invalid term: {term}; use YYW, YYS, or YYF')
+    year = int(match[1])
+    return (year + 2000 if year < 100 else year, {'W': 0, 'S': 1, 'F': 2}[match[2]])
+
+
+@app.post('/api/v1/admin/catalog/import', status_code=201)
+async def import_catalog(file: UploadFile = File(...)):
+    soup = BeautifulSoup(await file.read(), 'html.parser')
+    catalog = {}
+    for table in soup.find_all('table'):
+        rows = table.find_all('tr')
+        mapping = None
+        for row in rows:
+            cells = row.find_all(['th', 'td'], recursive=False)
+            values = [c.get_text(' ', strip=True) for c in cells]
+            labels = [v.lower() for v in values]
+            if {'course code', 'credits', 'prerequisites', 'cross-listed'}.issubset(labels):
+                mapping = {label: labels.index(label) for label in labels}
+                continue
+            if not mapping or len(values) <= max(mapping.values()):
+                continue
+            get = lambda key: values[mapping[key]] if key in mapping else ''
+            codes = course_codes(get('course code'))
+            if not codes:
+                continue
+            catalog[codes[0]] = {'course_code': get('course code'),
+                'credits': read_credits(get('credits')),
+                'prerequisites': course_codes(get('prerequisites')),
+                'cross_listed': course_codes(get('cross-listed'))}
+    if not catalog:
+        raise HTTPException(422, detail='No catalog courses found in the uploaded table')
+    with app.state.lock:
+        app.state.catalog = catalog
+    return {'status': 'success', 'courses_imported': len(catalog)}
+
+
+@app.get('/api/v1/students/{student_id}/audit-report')
+def audit_report(student_id: str, strict: bool = False):
+    with app.state.lock:
+        student = require_student(student_id)
+        history = [dict(c) for c in student['history']]
+        plan = [dict(c) for c in student['plan']]
+        catalog = dict(app.state.catalog)
+    completed = {}
+    for course in history:
+        if course['status'] == 'Completed':
+            code = normalize_code(course['course_code'])
+            completed[code] = max(completed.get(code, 0), course['credits_earned'])
+    timeline = []
+    violations = []
+    seen_plan = set()
+    planned_credits = 0
+    for course in sorted(plan, key=lambda c: term_order(c['term'])):
+        code = normalize_code(course['course_code'])
+        order = term_order(course['term'])
+        errors = []
+        spec = catalog.get(code)
+        if spec is None:
+            errors.append({'type': 'UNKNOWN_COURSE', 'course_code': course['course_code']})
+        else:
+            if code not in seen_plan:
+                planned_credits += spec['credits']
+                seen_plan.add(code)
+            available = {normalize_code(h['course_code']) for h in history
+                if h['status'] == 'Completed' and term_order(h['term']) < order}
+            available.update(normalize_code(p['course_code']) for p in plan
+                if term_order(p['term']) < order)
+            for prereq in spec['prerequisites']:
+                if prereq not in available:
+                    errors.append({'type': 'MISSING_PREREQUISITE',
+                        'course_code': course['course_code'], 'prerequisite': prereq})
+            related = set(spec['cross_listed'])
+            related.update(k for k, v in catalog.items() if code in v['cross_listed'])
+            for other in sorted(related):
+                if other in completed or any(normalize_code(p['course_code']) == other for p in plan):
+                    violation = {'type': 'CROSS_LIST_VIOLATION', 'course_code': course['course_code'], 'conflicting_course': other}
+                    if violation not in violations:
+                        violations.append(violation)
+        timeline.append({**course, 'errors': errors})
+    has_issues = bool(violations or any(e['errors'] for e in timeline))
+    earned = sum(completed.values())
+    return {'student_id': student_id,
+        'status': ('failed' if strict else 'warning') if has_issues else 'passed',
+        'timeline_validation': timeline, 'cross_list_violations': violations,
+        'credit_summary': {'total_earned': earned, 'total_planned': planned_credits,
+            'total_remaining_for_graduation': max(0, 120 - earned - planned_credits)}}

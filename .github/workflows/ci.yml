@@ -1,0 +1,36 @@
+name: Phase 3 API verification
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt httpx
+      - name: Test history and plans
+        run: python test_local.py
+      - name: Test audit API with supplied practice grader
+        run: |
+          uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/api.log 2>&1 &
+          trap 'kill $! || true' EXIT
+          python - <<'PY'
+          import time, httpx
+          for attempt in range(30):
+              try:
+                  if httpx.get('http://127.0.0.1:8000/').status_code == 200:
+                      break
+              except httpx.HTTPError:
+                  pass
+              time.sleep(1)
+          else:
+              raise SystemExit('API did not start')
+          PY
+          python verify_phase3.py
